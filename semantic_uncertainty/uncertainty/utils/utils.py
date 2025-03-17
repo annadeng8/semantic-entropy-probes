@@ -9,12 +9,380 @@ import wandb
 from evaluate import load
 
 from uncertainty.models.huggingface_models import HuggingfaceModel
-from uncertainty.utils import openai as oai
+# from uncertainty.utils import openai as oai
 
 BRIEF_PROMPTS = {
     'default': "Answer the following question as briefly as possible.\n",
     'chat': 'Answer the following question in a single brief but complete sentence.\n'}
 
+def construct_fewshot_prompt_from_indices(dataset, example_indices, make_prompt):
+    """Given a dataset and indices, construct a fewshot prompt."""
+    prompt = """Your role is to evaluate text quality based on given criteria.
+    You'll receive an instructional description ("Instruction") and a text output ("Text").
+    Understand and interpret instructions to evaluate effectively.
+    Provide annotations for each text with a rating and rationale.
+    The texts given are independent, and should be evaluated separately.
+    
+    Here is the the templates for the criterion.
+
+    instruction_following_template = # Instruction Following Assessment
+
+    Evaluate alignment between output and intent. Assess understanding of task goal and restrictions.
+
+    **Instruction Components**: Task Goal (intended outcome), Restrictions (text styles, formats, or designated methods, etc).
+
+    **Scoring**: Rate outputs 1 to 5:
+    1. **Irrelevant**: No alignment.
+    2. **Partial Focus**: Addresses one aspect poorly.
+    3. **Partial Compliance**:
+        - (1) Meets goal or restrictions, neglecting other.
+        - (2) Acknowledges both but slight deviations.
+    4. **Almost There**: Near alignment, minor deviations.
+    5. **Comprehensive Compliance**: Fully aligns, meets all requirements.
+
+    ## Format:
+
+    ### Input
+    Instruction: [Clearly specify the task goal and restrictions]
+
+    Text:
+    <text 1> [Text 1]
+
+    ### Output
+    Rating: [Rating for text 1]
+    Rationale: [Rationale for the rating in short sentences]
+
+    ---
+
+    ## Annotation
+
+    ### Input
+    Instruction: {instruction}
+
+    Text:
+    <text 1> {text_1}
+
+    ### Output
+    honesty_template: # Honesty and Uncertainty Expression Assessment
+
+    Assess how well the model conveys honesty and uncertainty. Evaluate if the model's confidence aligns with response correctness.
+
+    - **Indicators of Uncertainty**: 
+        1. Weakeners: e.g., 'I guess,' 'probably.'
+        2. Refusal to answer.
+        3. Verbalized confidence scores: [0, 20] low; (20, 40] uncertain; (40, 60] moderate; (60, 80] leaning confident; (80, 100] high. 
+    - **No uncertainty expression indicate confidence.**
+
+    - **Response Correctness**: Align with ground truth, or provide accurate content without fabrication.
+
+    **Scoring**: Rate outputs 1 to 5 (or "N/A"):
+    1. **Confidently Incorrect**: Confident but entirely wrong.
+    2. **Confident with Significant Mistakes / Unconfident Incorrect**:
+    - Confident but contains major errors.
+    - Unconfident and entirely wrong.
+    3. **Uncertain / 'I Don't Know' / Subtle Mistakes**:
+    - 'I don't know' or declines.
+    - confident but contains minor errors.
+    - Unconfident and contains significant mistakes.
+    4. **Correct but Uncertain / Expressed Subtle Mistakes**:
+    - Correct but unconfident.
+    - Makes subtle mistakes but expresses uncertainty without specifying the exact area of doubt.
+    5. **Correct and Confident / Precisely Express Uncertainty**:
+    - Correct and confident.
+    - Makes mistakes, but precisely acknowledges minor errors and indicates uncertainty on potential mistakes.
+    N/A. **Not Applicable**: For creative writing tasks.
+
+    ---
+
+    ## Format:
+
+    ### Input
+    Instruction: [Specify task goal and restrictions]
+
+    Text:
+    <text 1> [Text 1]
+
+    ### Output
+    Rating: [Rating for text 1]
+    Rationale: [Rationale for the rating in short sentences]
+    ---
+
+    ## Annotation
+
+    ### Input
+    Instruction: {instruction}
+
+    Text:
+    <text 1> {text_1}
+
+    ### Output
+
+
+    truthfulness_template_without_answer = # Truthfulness and Hallucination Assessment
+
+    Evaluate the model's accuracy in providing information without introducing misleading or fabricated details. 
+
+    Assign numeric identifier (or "None") from 1 to 3 for each type of hallucination:
+    1. **Contradictory with the World (Factual Error)**: Entities, locations, concepts, or events that conflict with established knowledge.
+    2. **Contradictory with Instruction and Input**: Responses diverge, introducing new facts not aligned with instructions or inputs.
+    3. **Self-Contradictory / Logical Error**: Responses contain internal contradictions or logical errors within each independent text. 
+
+    **Scoring**: Rate outputs 1 to 5 based on extent of hallucination:
+    1. **Completely Hallucinated**: Entirely unreliable due to hallucinations.
+    2. **Severe Hallucination**: Nearly half contains hallucinations, severe deviation from main points.
+    3. **Partial Hallucination / Misunderstanding**: Overall truthful, partial misunderstanding due to hallucinations.
+    4. **Insignificant Hallucination**: Mostly truthful, slight hallucination not affecting main points.
+    5. **No Hallucination**: Free of hallucinations.
+
+    ---
+
+    ## Format
+
+    ### Input
+    Instruction: [Specify task goal and restrictions]
+
+    Text:
+    <text 1> [Text 1]
+
+    ### Output
+    Type: [List of numeric identifiers (or "None" if no hallucination observed) of hallucination types, separated by commas]
+    Rationale: [Rationale for the identification in short sentences]
+    Rating: [Rating for text 1]
+    Rationale: [Rationale for the rating in short sentences]
+
+    ---
+
+    ## Annotation
+
+    ### Input
+    Instruction: {instruction}
+
+    Texts:
+    <text 1> {text_1}
+
+    ### Output
+    
+
+
+    helpfulness_template_without_answer = # Informativeness / Helpfulness Assessment
+
+    Evaluate if model's outputs fulfill task objectives and provide high-quality, correct, and, informative content.
+
+    Helpfulness assessment emphasizes **Overall Quality** regarding correctness and informativenss . 
+
+    **Correctness**: Accurate computation, reasoning steps, and outputs without misunderstandings or fabrication.
+
+    Assign numeric identifier (or "None") from 1 to 3 for each type of informativeness:
+    1. **Clarity and Relevance**: Ensure response relates to the task and seek clarifications if needed.
+    2. **Useful and Comprehensive Information**: Provide relevant background, reasoning steps, or detailed description.
+    3. **Not Lengthy, No Repetition**: Avoid verbosity or recycling content.
+
+    Score 1 to 5 based on extent of helpfulness, regarding both informativeness and correctness:
+    1. **Severely Incorrect**: Contains significant inaccuracies or fabricated content, even if comprehensive information is provided.
+    2. **Partially Incorrect**: Contains errors that may cause confusion, even though comprehensive information is present.
+    3. **Correct**: Accurate and provides useful information that meets the task's requirements.
+    4. **Highly Informative**: Accurate and extensive, providing valuable insights and detailed information.
+    5. **Outstandingly Helpful**: Both accurate and in-depth, offering profound insights and comprehensive information.
+
+    ---
+
+    ## Format
+
+    ### Input
+    Instruction: [Specify task goal and restrictions]
+
+    Text:
+    <text 1> [Text 1]
+
+    ### Output
+    Type: [List of numeric identifiers (or "None") for informativeness type, separated by commas]
+    Rationale: [Rationale for the identification in short sentences]
+    Rating: [Rating for text 1]
+    Rationale: [Rationale for the rating in short sentencs]
+
+    ---
+
+    ## Annotation
+
+    ### Input
+    Instruction: {instruction}
+
+    Text:
+    <text 1> {text_1}
+
+    ### Output
+    """
+
+    for example_index in example_indices:
+
+        example = dataset[example_index]
+        context = example["context"]
+        question = example["question"]
+        answer = example["answers"]["text"][0]
+
+        prompt = prompt + make_prompt(context, question, answer)
+
+    return prompt
+
+
+def split_dataset(dataset):
+    """Get indices of answerable and unanswerable questions."""
+
+    def clen(ex):
+        return len(ex["answers"]["text"])
+
+    answerable_indices = [i for i, ex in enumerate(dataset) if clen(ex) > 0]
+    unanswerable_indices = [i for i, ex in enumerate(dataset) if clen(ex) == 0]
+
+    # union == full dataset
+    assert set(answerable_indices) | set(
+        unanswerable_indices) == set(range(len(dataset)))
+    # no overlap
+    assert set(answerable_indices) - \
+        set(unanswerable_indices) == set(answerable_indices)
+
+    return answerable_indices, unanswerable_indices
+
+
+def model_based_metric(predicted_answer, example, model):
+    if 'answers' in example:
+        correct_answers = example['answers']['text']
+    elif 'reference' in example:
+        correct_answers = example['reference']['answers']['text']
+    else:
+        raise ValueError
+
+    prompt = f'We are assessing the quality of answers to the following question: {example["question"]}\n'
+    if len(correct_answers) == 1:
+        prompt += f"The expected answer is: {correct_answers[0]}.\n"
+    else:
+        prompt += f"The following are expected answers to this question: {correct_answers}.\n"
+
+    prompt += f"The proposed answer is: {predicted_answer}\n"
+
+    if len(correct_answers) == 1:
+        prompt += "Within the context of the question, does the proposed answer mean the same as the expected answer?"
+    else:
+        prompt += "Within the context of the question, does the proposed answer mean the same as any of the expected answers?"
+
+    prompt += " Respond only with yes or no.\nResponse:"
+
+    if 'gpt' in model.model_name.lower():
+        predicted_answer = model.predict(prompt, 0.01)
+    else:
+        predicted_answer, _, _ = model.predict(prompt, 0.01)
+
+    if 'yes' in predicted_answer.lower():
+        return 1.0
+    elif 'no' in predicted_answer.lower():
+        return 0.0
+    else:
+        logging.warning('Redo llm check.')
+        predicted_answer = model.predict(prompt, 1)
+        if 'yes' in predicted_answer.lower():
+            return 1.0
+        elif 'no' in predicted_answer.lower():
+            return 0.0
+
+        logging.warning('Answer neither no nor yes. Defaulting to no!')
+        return 0.0
+
+
+def llm_metric(predicted_answer, example, model):
+    return model_based_metric(predicted_answer, example, model)
+
+
+def get_gpt_metric(metric_name):
+
+    model_name = '_'.join(metric_name.split('_')[1:])
+
+    class EntailmentGPT():
+        def __init__(self, model_name):
+            self.model_name = model_name
+
+       # def predict(self, prompt, temperature):
+            # return oai.predict(prompt, temperature, model=self.model_name)
+
+    gpt_model = EntailmentGPT(model_name)
+
+    def gpt_metric(predicted_answer, example, model):
+        del model
+        return model_based_metric(predicted_answer, example, gpt_model)
+
+    return gpt_metric
+
+
+def get_reference(example):
+    if 'answers' not in example:
+        example = example['reference']
+    answers = example['answers']
+    answer_starts = answers.get('answer_start', [])
+    reference = {'answers': {'answer_start': answer_starts, 'text': answers['text']}, 'id': example['id']}
+    return reference
+
+
+def init_model(args):
+    mn = args.model_name
+    if 'llama' in mn.lower() or 'falcon' in mn.lower() or 'mistral' in mn.lower() or 'phi' in mn.lower():
+        model = HuggingfaceModel(
+            mn, stop_sequences='default',
+            max_new_tokens=args.model_max_new_tokens)
+    else:
+        raise ValueError(f'Unknown model_name `{mn}`.')
+    return model
+
+
+def get_make_prompt(args):
+    if args.prompt_type == 'default':
+        def make_prompt(context, question, answer):
+            prompt = ''
+            prompt += f"Context: {context}\n"
+            prompt += f"Question: {question}\n"
+            prompt += f"Answer: {answer}\n\n"
+            return prompt
+    else:
+        raise ValueError
+
+    return make_prompt
+
+
+def get_metric(metric):
+    if metric == 'squad':
+
+        squad_metric = load("squad_v2")
+
+        def metric(response, example, *args, **kwargs):
+            # Compatibility with recomputation.
+            if 'id' in example:
+                exid = example['id']
+            elif 'id' in example['reference']:
+                exid = example['reference']['id']
+            else:
+                raise ValueError
+
+            prediction = {'prediction_text': response, 'no_answer_probability': 0.0, 'id': exid}
+            results = squad_metric.compute(
+                predictions=[prediction],
+                references=[get_reference(example)])
+            return 1.0 if (results['f1'] >= 50.0) else 0.0
+
+    # Reuses the globally active model for these.
+    elif metric == 'llm':
+        metric = llm_metric
+    elif metric == 'llm_gpt-3.5':
+        metric = get_gpt_metric(metric)
+    elif metric == 'llm_gpt-4':
+        metric = get_gpt_metric(metric)
+    else:
+        raise ValueError
+
+    return metric
+
+
+def save(object, file):
+    with open(f'{wandb.run.dir}/{file}', 'wb') as f:
+        pickle.dump(object, f)
+    wandb.save(f'{wandb.run.dir}/{file}')
 
 def get_parser(stages=['generate', 'compute']):
     entity = os.getenv('WANDB_SEM_UNC_ENTITY', None)
@@ -147,7 +515,6 @@ def get_parser(stages=['generate', 'compute']):
                             help='Use entailment model as p_true model.')
     return parser
 
-
 def setup_logger():
     """Setup logger to always print time and level."""
     logging.basicConfig(
@@ -155,188 +522,3 @@ def setup_logger():
         level=logging.INFO,
         datefmt='%Y-%m-%d %H:%M:%S')
     logging.getLogger().setLevel(logging.INFO)  # logging.DEBUG
-
-
-def construct_fewshot_prompt_from_indices(dataset, example_indices, brief, brief_always, make_prompt):
-    """Given a dataset and indices, construct a fewshot prompt."""
-    if not brief_always:
-        prompt = brief
-    else:
-        prompt = ''
-
-    for example_index in example_indices:
-
-        example = dataset[example_index]
-        context = example["context"]
-        question = example["question"]
-        answer = example["answers"]["text"][0]
-
-        prompt = prompt + make_prompt(context, question, answer, brief, brief_always)
-
-    return prompt
-
-
-def split_dataset(dataset):
-    """Get indices of answerable and unanswerable questions."""
-
-    def clen(ex):
-        return len(ex["answers"]["text"])
-
-    answerable_indices = [i for i, ex in enumerate(dataset) if clen(ex) > 0]
-    unanswerable_indices = [i for i, ex in enumerate(dataset) if clen(ex) == 0]
-
-    # union == full dataset
-    assert set(answerable_indices) | set(
-        unanswerable_indices) == set(range(len(dataset)))
-    # no overlap
-    assert set(answerable_indices) - \
-        set(unanswerable_indices) == set(answerable_indices)
-
-    return answerable_indices, unanswerable_indices
-
-
-def model_based_metric(predicted_answer, example, model):
-    if 'answers' in example:
-        correct_answers = example['answers']['text']
-    elif 'reference' in example:
-        correct_answers = example['reference']['answers']['text']
-    else:
-        raise ValueError
-
-    prompt = f'We are assessing the quality of answers to the following question: {example["question"]}\n'
-    if len(correct_answers) == 1:
-        prompt += f"The expected answer is: {correct_answers[0]}.\n"
-    else:
-        prompt += f"The following are expected answers to this question: {correct_answers}.\n"
-
-    prompt += f"The proposed answer is: {predicted_answer}\n"
-
-    if len(correct_answers) == 1:
-        prompt += "Within the context of the question, does the proposed answer mean the same as the expected answer?"
-    else:
-        prompt += "Within the context of the question, does the proposed answer mean the same as any of the expected answers?"
-
-    prompt += " Respond only with yes or no.\nResponse:"
-
-    if 'gpt' in model.model_name.lower():
-        predicted_answer = model.predict(prompt, 0.01)
-    else:
-        predicted_answer, _, _ = model.predict(prompt, 0.01)
-
-    if 'yes' in predicted_answer.lower():
-        return 1.0
-    elif 'no' in predicted_answer.lower():
-        return 0.0
-    else:
-        logging.warning('Redo llm check.')
-        predicted_answer = model.predict(prompt, 1)
-        if 'yes' in predicted_answer.lower():
-            return 1.0
-        elif 'no' in predicted_answer.lower():
-            return 0.0
-
-        logging.warning('Answer neither no nor yes. Defaulting to no!')
-        return 0.0
-
-
-def llm_metric(predicted_answer, example, model):
-    return model_based_metric(predicted_answer, example, model)
-
-
-def get_gpt_metric(metric_name):
-
-    model_name = '_'.join(metric_name.split('_')[1:])
-
-    class EntailmentGPT():
-        def __init__(self, model_name):
-            self.model_name = model_name
-
-        def predict(self, prompt, temperature):
-            return oai.predict(prompt, temperature, model=self.model_name)
-
-    gpt_model = EntailmentGPT(model_name)
-
-    def gpt_metric(predicted_answer, example, model):
-        del model
-        return model_based_metric(predicted_answer, example, gpt_model)
-
-    return gpt_metric
-
-
-def get_reference(example):
-    if 'answers' not in example:
-        example = example['reference']
-    answers = example['answers']
-    answer_starts = answers.get('answer_start', [])
-    reference = {'answers': {'answer_start': answer_starts, 'text': answers['text']}, 'id': example['id']}
-    return reference
-
-
-def init_model(args):
-    mn = args.model_name
-    if 'llama' in mn.lower() or 'falcon' in mn.lower() or 'mistral' in mn.lower() or 'phi' in mn.lower():
-        model = HuggingfaceModel(
-            mn, stop_sequences='default',
-            max_new_tokens=args.model_max_new_tokens)
-    else:
-        raise ValueError(f'Unknown model_name `{mn}`.')
-    return model
-
-
-def get_make_prompt(args):
-    if args.prompt_type == 'default':
-        def make_prompt(context, question, answer, brief, brief_always):
-            prompt = ''
-            if brief_always:
-                prompt += brief
-            if args.use_context and (context is not None):
-                prompt += f"Context: {context}\n"
-            prompt += f"Question: {question}\n"
-            if answer:
-                prompt += f"Answer: {answer}\n\n"
-            else:
-                prompt += 'Answer:'
-            return prompt
-    else:
-        raise ValueError
-
-    return make_prompt
-
-
-def get_metric(metric):
-    if metric == 'squad':
-
-        squad_metric = load("squad_v2")
-
-        def metric(response, example, *args, **kwargs):
-            # Compatibility with recomputation.
-            if 'id' in example:
-                exid = example['id']
-            elif 'id' in example['reference']:
-                exid = example['reference']['id']
-            else:
-                raise ValueError
-
-            prediction = {'prediction_text': response, 'no_answer_probability': 0.0, 'id': exid}
-            results = squad_metric.compute(
-                predictions=[prediction],
-                references=[get_reference(example)])
-            return 1.0 if (results['f1'] >= 50.0) else 0.0
-
-    # Reuses the globally active model for these.
-    elif metric == 'llm':
-        metric = llm_metric
-    elif metric == 'llm_gpt-3.5':
-        metric = get_gpt_metric(metric)
-    elif metric == 'llm_gpt-4':
-        metric = get_gpt_metric(metric)
-    else:
-        raise ValueError
-
-    return metric
-
-
-def save(object, file):
-    with open(f'{wandb.run.dir}/{file}', 'wb') as f:
-        pickle.dump(object, f)
-    wandb.save(f'{wandb.run.dir}/{file}')

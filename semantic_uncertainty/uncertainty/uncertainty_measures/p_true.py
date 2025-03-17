@@ -23,7 +23,7 @@ def construct_few_shot_prompt(
             prompt_candidate += ['\n']
         prompt_candidate += ['Question: ' + question]
         prompt_candidate += ['\nBrainstormed Answers: ']
-        current_question = make_prompt(context, question, None, brief, brief_always)
+        current_question = make_prompt(context, question, None)
         local_prompt = prompt + current_question
         logging.info('P_TRUE >> Current Question: '.ljust(25) + current_question)
 
