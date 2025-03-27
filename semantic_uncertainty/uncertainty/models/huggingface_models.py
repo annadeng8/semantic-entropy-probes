@@ -131,7 +131,11 @@ class HuggingfaceModel(BaseModel):
             input_ids = input_ids[:max_allowed_input_tokens]
             input_data = self.tokenizer.decode(input_ids)
 
-        inputs = self.tokenizer(input_data, return_tensors="pt").to(device)
+        inputs = {
+            "input_ids": torch.tensor([input_ids], device=device),
+            "attention_mask": torch.ones(len(input_ids), dtype=torch.long, device=device).unsqueeze(0)
+        }
+
 
         if 'llama' in self.model_name.lower() or 'falcon' in self.model_name or 'mistral' in self.model_name.lower():
             if 'token_type_ids' in inputs:  # HF models seems has changed.

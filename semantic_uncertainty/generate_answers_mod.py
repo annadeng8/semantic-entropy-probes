@@ -4,6 +4,7 @@ import os
 import logging
 import random
 from tqdm import tqdm
+import hashlib
 
 import numpy as np
 import torch
@@ -21,7 +22,7 @@ def main(args):
     experiment_details = {'args': args}
     random.seed(args.random_seed)
 
-    metric = utils.get_metric(args.metric)
+    metric = utils.get_metric('llm')
 
     
     # Load dataset
@@ -39,13 +40,15 @@ def main(args):
     
     def reformat(example, j):
         try:
+            md5hash = lambda s: str(int(hashlib.md5(s.encode('utf-8')).hexdigest(), 16))
             return {
                 'question': 'Evaluate the following model response: '+example['completions'][j].get('response', 'No response found'), 
                 'context': example['instruction'],
-                'answers': {'text': [str(example['completions'][j].get('annotations'))]}
+                'answers': {'text': [str(example['completions'][j].get('annotations'))]},
+                'id': md5hash(str(example['instruction']))
             }
         except:
-            print(example)
+            print("ERROR")
     
 
     train_dataset = [x for d in train_dataset for j in range(4) if (x := reformat(d, j)) is not None]
@@ -63,19 +66,24 @@ def main(args):
     experiment_details['prompt_indices'] = prompt_indices
     remaining_answerable = list(set(answerable_indices) - set(prompt_indices))
 
+    print("creating few-shot prompt")
     # Create Few-Shot prompt.
     make_prompt = utils.get_make_prompt(args)
     prompt = utils.construct_fewshot_prompt_from_indices(
         train_dataset, prompt_indices, make_prompt)
     experiment_details['prompt'] = prompt
     logging.info('Prompt is: %s', prompt)
+    print('Prompt is: %s', prompt)
 
     # Initialize model.
+    print("initialize model")
     model = utils.init_model(args)
 
     if args.compute_p_true:
         logging.info(80*'#')
         logging.info('Constructing few-shot prompt for p_true.')
+        print(80*'#')
+        print('Constructing few-shot prompt for p_true.')
 
         p_true_indices = random.sample(answerable_indices, args.p_true_num_fewshot)
         remaining_answerable = list(set(remaining_answerable) - set(p_true_indices))
@@ -94,14 +102,25 @@ def main(args):
         logging.info('p_true_few_shot_prompt: %s', p_true_few_shot_prompt)
         logging.info(80*'#')
 
+        print('Finished constructing few-shot prompt for p_true.')
+        print(80*'#')
+        print('p_true_few_shot_prompt: %s', p_true_few_shot_prompt)
+        print(80*'#')
+
     # Start answer generation.
     logging.info(80 * '=')
     logging.info('Generating answers: ')
     logging.info(80 * '=')
+    print(80 * '=')
+    print('Generating answers: ')
+    print(80 * '=')
     for dataset_split in ['train', 'validation']:
         logging.info(80 * 'x')
+        print(80 * 'x')
         logging.info('Starting with dataset_split %s.', dataset_split)
+        print('starting with dataset_split', dataset_split)
         logging.info(80 * 'x')
+        print(80 * 'x')
 
         # This will store all input data and model predictions.
         accuracies, generations, results_dict, p_trues = [], {}, {}, []
@@ -109,6 +128,7 @@ def main(args):
         if dataset_split == 'train':
             if not args.get_training_set_generations:
                 logging.info('Skip training data.')
+                print("skip training data")
                 continue
             dataset = train_dataset
             possible_indices = list(set(remaining_answerable) | set(unanswerable_indices))
@@ -123,6 +143,7 @@ def main(args):
 
         if args.num_samples > len(dataset):
             logging.warning('Not enough samples in dataset. Using all %d samples.', len(dataset))
+            print('Not enough samples in dataset. Using all %d samples.', len(dataset))
 
         it = 0
         for index in tqdm(indices):
@@ -140,7 +161,7 @@ def main(args):
             current_input = make_prompt(
                 context, question, None)
             local_prompt = prompt + current_input
-
+            print("current input: ".ljust(15) + current_input)
             logging.info('Current input: '.ljust(15) + current_input)
 
             full_responses = []
@@ -203,6 +224,7 @@ def main(args):
                     hint=args.p_true_hint)
                 p_trues.append(p_true)
                 logging.info('p_true: %s', p_true)
+                print('p_true:', p_true)
 
         # Save generations for that split.
         utils.save(generations, f'{dataset_split}_generations.pkl')
@@ -230,6 +252,7 @@ if __name__ == '__main__':
     parser = utils.get_parser()
     args, unknown = parser.parse_known_args()
     logging.info('Starting new run with args: %s', args)
+    print('Starting new run with args: %s', args)
 
     if unknown:
         raise ValueError(f'Unkown args: {unknown}')
