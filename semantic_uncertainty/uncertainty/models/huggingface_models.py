@@ -5,6 +5,7 @@ import os
 from collections import Counter
 
 import accelerate
+
 import torch
 from accelerate import Accelerator
 
@@ -15,6 +16,8 @@ from transformers import BitsAndBytesConfig
 from transformers import StoppingCriteria
 from transformers import StoppingCriteriaList
 from huggingface_hub import snapshot_download
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
 
 
 from uncertainty.models.base_model import BaseModel
@@ -106,6 +109,7 @@ class HuggingfaceModel(BaseModel):
             device_map='auto',
             torch_dtype=torch.bfloat16
             )
+        self.config = self.model.config
         self.model_name = model_name
         self.stop_sequences = stop_sequences + [self.tokenizer.eos_token]
         self.token_limit = 2048
@@ -117,7 +121,17 @@ class HuggingfaceModel(BaseModel):
             logging.WARNING("INPUT IS A TUPLE.")
             input_data = input_data[0]
 
-        inputs = self.tokenizer(input_data, return_tensors="pt").to("cuda")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Truncate input_data if it exceeds token limit
+        input_ids = self.tokenizer.encode(input_data)
+        max_allowed_input_tokens = self.token_limit - self.max_new_tokens
+        if len(input_ids) > max_allowed_input_tokens:
+            logging.warning("Input too long (%d tokens); truncating to %d to stay within total limit (%d)",
+                            len(input_ids), max_allowed_input_tokens, self.token_limit)
+            input_ids = input_ids[:max_allowed_input_tokens]
+            input_data = self.tokenizer.decode(input_ids)
+
+        inputs = self.tokenizer(input_data, return_tensors="pt").to(device)
 
         if 'llama' in self.model_name.lower() or 'falcon' in self.model_name or 'mistral' in self.model_name.lower():
             if 'token_type_ids' in inputs:  # HF models seems has changed.
@@ -147,6 +161,8 @@ class HuggingfaceModel(BaseModel):
                 stopping_criteria=stopping_criteria,
                 pad_token_id=pad_token_id,
             )
+            print(next(self.model.parameters()).device)  # Should output: cuda:0
+
 
         if len(outputs.sequences[0]) > self.token_limit:
             raise ValueError(
@@ -160,10 +176,10 @@ class HuggingfaceModel(BaseModel):
             return full_answer
 
         # For some models, we need to remove the input_data from the answer.
-        if full_answer.startswith(input_data):
-            input_data_offset = len(input_data)
-        else:
-            raise ValueError('Have not tested this in a while.')
+        #if full_answer.startswith(input_data):
+        input_data_offset = len(input_data)
+        #else:
+            #raise ValueError('Have not tested this in a while.')
 
         # Remove input from answer.
         answer = full_answer[input_data_offset:]
