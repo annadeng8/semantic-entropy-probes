@@ -226,11 +226,19 @@ def get_metric(metric):
 
     return metric
 
-
+"""
 def save(object, file):
     with open(f'{wandb.run.dir}/{file}', 'wb') as f:
         pickle.dump(object, f)
     wandb.save(f'{wandb.run.dir}/{file}')
+"""
+def save(obj, file, save_dir="/workspace/saved"):
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, file)
+    with open(save_path, "wb") as f:
+        pickle.dump(obj, f)
+    print(f"[Saved] {file} → {save_path}")
+
 
 def get_parser(stages=['generate', 'compute']):
     entity = os.getenv('WANDB_SEM_UNC_ENTITY', None)

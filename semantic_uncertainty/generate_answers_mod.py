@@ -227,7 +227,8 @@ def main(args):
                 print('p_true:', p_true)
 
         # Save generations for that split.
-        utils.save(generations, f'{dataset_split}_generations.pkl')
+        # utils.save(generations, f'{dataset_split}_generations.pkl')
+        utils.save(generations, f'{dataset_split}_generations.pkl', save_dir="/workspace/saved")
 
         # Log overall accuracy.
         accuracy = np.mean(accuracies)
@@ -239,9 +240,10 @@ def main(args):
                     'p_false':  [1 - p for p in p_trues],
                     'p_false_fixed':  [1 - np.exp(p) for p in p_trues],
                 }
-            utils.save(results_dict, 'uncertainty_measures.pkl')
+            #utils.save(results_dict, 'uncertainty_measures.pkl')
+            utils.save(results_dict, 'uncertainty_measures.pkl', save_dir="/workspace/saved")
 
-    utils.save(experiment_details, 'experiment_details.pkl')
+    utils.save(experiment_details, 'experiment_details.pkl', save_dir="/workspace/saved")
     logging.info('Run complete.')
     del model
 

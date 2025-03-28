@@ -112,7 +112,7 @@ class HuggingfaceModel(BaseModel):
         self.config = self.model.config
         self.model_name = model_name
         self.stop_sequences = stop_sequences + [self.tokenizer.eos_token]
-        self.token_limit = 2048
+        self.token_limit = 8192
 
     
     def predict(self, input_data, temperature, return_full=False, return_latent=False):
