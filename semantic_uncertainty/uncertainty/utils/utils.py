@@ -120,16 +120,16 @@ def model_based_metric(predicted_answer, example, model):
     else:
         predicted_answer, _, _ = model.predict(prompt, 0.01)
 
-    if 'yes' in predicted_answer.lower():
+    if 'Yes' in predicted_answer:
         return 1.0
-    elif 'no' in predicted_answer.lower():
+    elif 'No' in predicted_answer:
         return 0.0
     else:
         logging.warning('Redo llm check.')
         predicted_answer = model.predict(prompt, 1)
-        if 'yes' in predicted_answer.lower():
+        if 'Yes' in predicted_answer:
             return 1.0
-        elif 'no' in predicted_answer.lower():
+        elif 'No' in predicted_answer:
             return 0.0
 
         logging.warning('Answer neither no nor yes. Defaulting to no!')
@@ -170,14 +170,14 @@ def get_reference(example):
 
 
 def init_model(args):
-    mn = args.model_name
-    if 'llama' in mn.lower() or 'falcon' in mn.lower() or 'mistral' in mn.lower() or 'phi' in mn.lower():
+        mn = 'gemma-2-2b-it'
+    #if 'llama' in mn.lower() or 'falcon' in mn.lower() or 'mistral' in mn.lower() or 'phi' in mn.lower():
         model = HuggingfaceModel(
             mn, stop_sequences='default',
             max_new_tokens=args.model_max_new_tokens)
-    else:
-        raise ValueError(f'Unknown model_name `{mn}`.')
-    return model
+    #else:
+        #raise ValueError(f'Unknown model_name `{mn}`.')
+        return model
 
 
 def get_make_prompt(args):

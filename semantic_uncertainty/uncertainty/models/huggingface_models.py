@@ -116,7 +116,7 @@ class HuggingfaceModel(BaseModel):
 
     
     def predict(self, input_data, temperature, return_full=False, return_latent=False):
-
+        print(input_data)
         if isinstance(input_data, tuple):
             logging.WARNING("INPUT IS A TUPLE.")
             input_data = input_data[0]
