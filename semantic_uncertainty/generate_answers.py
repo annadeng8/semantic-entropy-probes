@@ -11,12 +11,12 @@ import openai
 import wandb
 
 from uncertainty.data.data_utils import load_ds
-from uncertainty.utils import utils
+from uncertainty.utils import utils_abstracted
 from uncertainty.uncertainty_measures import p_true as p_true_utils
 from compute_uncertainty_measures import main as main_compute
 
 
-utils.setup_logger()
+utils_abstracted.setup_logger()
 openai.api_key = os.getenv("OPENAI_API_KEY")  # Set up OpenAI API credentials.
 
 
@@ -50,7 +50,7 @@ def main(args):
     )
     logging.info('Finished wandb init.')
 
-    metric = utils.get_metric(args.metric)
+    metric = utils_abstracted.get_metric(args.metric)
 
     train_dataset, validation_dataset = load_ds(
         args.dataset, add_options=args.use_mc_options, seed=args.random_seed)
@@ -64,11 +64,11 @@ def main(args):
         logging.info('Train dataset: %s', train_dataset)
 
     # Get indices of answerable and unanswerable questions and construct prompt.
-    answerable_indices, unanswerable_indices = utils.split_dataset(train_dataset)
+    answerable_indices, unanswerable_indices = utils_abstracted.split_dataset(train_dataset)
 
     if args.answerable_only:
         unanswerable_indices = []
-        val_answerable, val_unanswerable = utils.split_dataset(validation_dataset)
+        val_answerable, val_unanswerable = utils_abstracted.split_dataset(validation_dataset)
         del val_unanswerable
         validation_dataset = [validation_dataset[i] for i in val_answerable]
 
@@ -77,17 +77,17 @@ def main(args):
     remaining_answerable = list(set(answerable_indices) - set(prompt_indices))
 
     # Create Few-Shot prompt.
-    make_prompt = utils.get_make_prompt(args)
-    BRIEF = utils.BRIEF_PROMPTS[args.brief_prompt]
+    make_prompt = utils_abstracted.get_make_prompt(args)
+    BRIEF = utils_abstracted.BRIEF_PROMPTS[args.brief_prompt]
     arg = args.brief_always if args.enable_brief else True
-    prompt = utils.construct_fewshot_prompt_from_indices(
+    prompt = utils_abstracted.construct_fewshot_prompt_from_indices(
         train_dataset, prompt_indices, BRIEF, arg, make_prompt)
     experiment_details['prompt'] = prompt
     experiment_details['BRIEF'] = BRIEF
     logging.info('Prompt is: %s', prompt)
 
     # Initialize model.
-    model = utils.init_model(args)
+    model = utils_abstracted.init_model(args)
 
     # Initialize prompt for p_true baseline.
     if args.compute_p_true:
@@ -96,7 +96,7 @@ def main(args):
 
         p_true_indices = random.sample(answerable_indices, args.p_true_num_fewshot)
         remaining_answerable = list(set(remaining_answerable) - set(p_true_indices))
-        p_true_few_shot_prompt, p_true_responses, len_p_true = p_true_utils.construct_few_shot_prompt(
+        p_true_few_shot_prompt, p_true_responses, len_p_true = p_true_utils_abstracted.construct_few_shot_prompt(
             model=model, dataset=train_dataset, indices=p_true_indices,
             prompt=prompt, brief=BRIEF,
             brief_always=args.brief_always and args.enable_brief,
@@ -213,7 +213,7 @@ def main(args):
 
                     generations[example['id']].update({
                         'most_likely_answer': most_likely_answer_dict,
-                        'reference': utils.get_reference(example),
+                        'reference': utils_abstracted.get_reference(example),
                     })
                 else:
                     logging.info('high-t prediction '.ljust(15) + str(i) + ' : ' + predicted_answer)
@@ -226,7 +226,7 @@ def main(args):
 
             if args.compute_p_true and dataset_split == 'validation':
                 # Already compute p_true here. Avoid cost of generations in compute_uncertainty script.
-                p_true = p_true_utils.calculate_p_true(
+                p_true = p_true_utils_abstracted.calculate_p_true(
                     model, question, most_likely_answer_dict['response'],
                     [r[0] for r in full_responses], p_true_few_shot_prompt,
                     hint=args.p_true_hint)
@@ -234,7 +234,7 @@ def main(args):
                 logging.info('p_true: %s', p_true)
 
         # Save generations for that split.
-        utils.save(generations, f'{dataset_split}_generations.pkl')
+        utils_abstracted.save(generations, f'{dataset_split}_generations.pkl')
 
         # Log overall accuracy.
         accuracy = np.mean(accuracies)
@@ -247,16 +247,16 @@ def main(args):
                     'p_false':  [1 - p for p in p_trues],
                     'p_false_fixed':  [1 - np.exp(p) for p in p_trues],
                 }
-            utils.save(results_dict, 'uncertainty_measures.pkl')
+            utils_abstracted.save(results_dict, 'uncertainty_measures.pkl')
 
-    utils.save(experiment_details, 'experiment_details.pkl')
+    utils_abstracted.save(experiment_details, 'experiment_details.pkl')
     logging.info('Run complete.')
     del model
 
 
 if __name__ == '__main__':
 
-    parser = utils.get_parser()
+    parser = utils_abstracted.get_parser()
     args, unknown = parser.parse_known_args()
     logging.info('Starting new run with args: %s', args)
 
