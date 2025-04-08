@@ -1,0 +1,11 @@
+tqdm
+datasets
+transformers
+wandb
+evaluate
+openai
+matplotlib
+accelerate
+scipy 
+scikit-learn
+tenacity
