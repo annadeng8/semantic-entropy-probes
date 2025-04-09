@@ -1,277 +1,131 @@
-"""Predict with LLM on task."""
-import gc
-import os
-import logging
-import random
-from tqdm import tqdm
-
+"""Generate evaluations with LLM, cache activations, and compute entropy with few-shot prompting."""
 import numpy as np
 import torch
-import openai
-import wandb
-
-from uncertainty.data.data_utils import load_ds
-from uncertainty.utils import utils_abstracted
-from uncertainty.uncertainty_measures import p_true as p_true_utils
-from compute_uncertainty_measures import main as main_compute
-
-
-utils_abstracted.setup_logger()
-openai.api_key = os.getenv("OPENAI_API_KEY")  # Set up OpenAI API credentials.
-
+from datasets import load_dataset
+from uncertainty.utils import utils
+import hashlib
+import random
 
 def main(args):
-    if args.dataset == 'svamp':
-        if not args.use_context:
-            logging.info('Forcing `use_context=True` for svamp dataset.')
-            args.use_context = True
-    elif args.dataset == 'squad':
-        if not args.answerable_only:
-            logging.info('Forcing `answerable_only=True` for squad dataset.')
-            args.answerable_only = True
-    
-    experiment_details = {'args': args}
-    random.seed(args.random_seed)
+    # Load and split dataset
+    dataset = load_dataset("openbmb/UltraFeedback")["train"].train_test_split(test_size=0.2, seed=42)
+    train_dataset = dataset["train"]
+    test_dataset = dataset["test"]
 
-    # Implement
-    user = os.environ['USER']
-    entity = os.environ['WANDB_ENT']
-    slurm_jobid = os.getenv('SLURM_JOB_ID', None)
-    scratch_dir = os.getenv('SCRATCH_DIR', '.')
-    if not os.path.exists(f"{scratch_dir}/{user}/uncertainty"):
-        os.makedirs(f"{scratch_dir}/{user}/uncertainty")
+    # Reformat dataset to include responses and annotations
+    def reformat(example, j):
+        try:
+            completion = example['completions'][j]
+            response = completion.get('response', 'No response found')
+            annotations = completion.get('annotations', {})
+            instruction_following = annotations.get('instruction_following', {})
+            rating = instruction_following.get('Rating', 'Unknown rating')
+            rationale = instruction_following.get('Rationale', 'No rationale provided')
+            md5hash = lambda s: str(int(hashlib.md5(s.encode('utf-8')).hexdigest(), 16))
+            return {
+                'question': example['instruction'],
+                'response': response,
+                'evaluation': f"Rating: {rating}\nRationale: {rationale}",
+                'id': md5hash(str(example['instruction']))
+            }
+        except:
+            return None
 
-    wandb.init(
-        entity=entity,
-        project="semantic_uncertainty" if not args.debug else "semantic_uncertainty_debug",
-        dir=f"{scratch_dir}/{user}/uncertainty",
-        config=args,
-        notes=f'slurm_id: {slurm_jobid}, experiment_lot: {args.experiment_lot}',
-    )
-    logging.info('Finished wandb init.')
+    train_dataset = [x for d in train_dataset for j in range(4) if (x := reformat(d, j)) is not None]
+    test_dataset = [x for d in test_dataset for j in range(4) if (x := reformat(d, j)) is not None]
 
-    metric = utils_abstracted.get_metric(args.metric)
+    # Construct few-shot prompt using Instruction, Question, Answer, and Rationale
+    def construct_fewshot_prompt(dataset, num_examples=10):
+        prompt = """You are an evaluator of text quality. Below are examples to guide your evaluation. Each example includes an Instruction (the task), Question (the specific query), Answer (the response), and Rationale (the reasoning behind the rating). Use these to provide your evaluation.\n\n"""
+        sampled_indices = random.sample(range(len(dataset)), min(num_examples, len(dataset)))
+        for idx in sampled_indices:
+            example = dataset[idx]
+            instruction = example['question']  # Instruction is the same as the question
+            question = example['question']     # Question is the same as instruction
+            answer = example['response']
+            evaluation = example['evaluation']
+            prompt += f"Instruction: {instruction}\nQuestion: {question}\nAnswer: {answer}\nEvaluation: {evaluation}\n\n"
+        prompt += "Now, provide your evaluation for the following AND GIVE NOTHING ELSE:\n"
+        return prompt
 
-    train_dataset, validation_dataset = load_ds(
-        args.dataset, add_options=args.use_mc_options, seed=args.random_seed)
-    if args.ood_train_dataset is not None:
-        logging.warning(
-            'Using OOD dataset %s to construct few-shot prompts and train p_ik.',
-            args.ood_train_dataset)
-        # Get indices of answerable and unanswerable questions and construct prompt.
-        train_dataset, _ = load_ds(args.ood_train_dataset, add_options=args.use_mc_options)
-    if not isinstance(train_dataset, list):
-        logging.info('Train dataset: %s', train_dataset)
+    # Initialize model
+    model = utils.init_model(args)
 
-    # Get indices of answerable and unanswerable questions and construct prompt.
-    answerable_indices, unanswerable_indices = utils_abstracted.split_dataset(train_dataset)
+    # Process each split
+    for dataset_split, dataset in [('train', train_dataset), ('validation', test_dataset)]:
+        print(f"Generating evaluations for {dataset_split} split")
+        generations = {}
 
-    if args.answerable_only:
-        unanswerable_indices = []
-        val_answerable, val_unanswerable = utils_abstracted.split_dataset(validation_dataset)
-        del val_unanswerable
-        validation_dataset = [validation_dataset[i] for i in val_answerable]
+        # Limit to a small subset for efficiency
+        indices = range(min(args.num_samples, len(dataset)))
 
-    prompt_indices = random.sample(answerable_indices, args.num_few_shot)
-    experiment_details['prompt_indices'] = prompt_indices
-    remaining_answerable = list(set(answerable_indices) - set(prompt_indices))
-
-    # Create Few-Shot prompt.
-    make_prompt = utils_abstracted.get_make_prompt(args)
-    BRIEF = utils_abstracted.BRIEF_PROMPTS[args.brief_prompt]
-    arg = args.brief_always if args.enable_brief else True
-    prompt = utils_abstracted.construct_fewshot_prompt_from_indices(
-        train_dataset, prompt_indices, BRIEF, arg, make_prompt)
-    experiment_details['prompt'] = prompt
-    experiment_details['BRIEF'] = BRIEF
-    logging.info('Prompt is: %s', prompt)
-
-    # Initialize model.
-    model = utils_abstracted.init_model(args)
-
-    # Initialize prompt for p_true baseline.
-    if args.compute_p_true:
-        logging.info(80*'#')
-        logging.info('Constructing few-shot prompt for p_true.')
-
-        p_true_indices = random.sample(answerable_indices, args.p_true_num_fewshot)
-        remaining_answerable = list(set(remaining_answerable) - set(p_true_indices))
-        p_true_few_shot_prompt, p_true_responses, len_p_true = p_true_utils_abstracted.construct_few_shot_prompt(
-            model=model, dataset=train_dataset, indices=p_true_indices,
-            prompt=prompt, brief=BRIEF,
-            brief_always=args.brief_always and args.enable_brief,
-            make_prompt=make_prompt, num_generations=args.num_generations,
-            metric=metric)
-        wandb.config.update(
-            {'p_true_num_fewshot': len_p_true}, allow_val_change=True)
-        wandb.log(dict(len_p_true=len_p_true))
-        experiment_details['p_true_indices'] = p_true_indices
-        experiment_details['p_true_responses'] = p_true_responses
-        experiment_details['p_true_few_shot_prompt'] = p_true_few_shot_prompt
-        logging.info('Finished constructing few-shot prompt for p_true.')
-        logging.info(80*'#')
-        logging.info('p_true_few_shot_prompt: %s', p_true_few_shot_prompt)
-        logging.info(80*'#')
-
-    # Start answer generation.
-    logging.info(80 * '=')
-    logging.info('Generating answers: ')
-    logging.info(80 * '=')
-    for dataset_split in ['train', 'validation']:
-        logging.info(80 * 'x')
-        logging.info('Starting with dataset_split %s.', dataset_split)
-        logging.info(80 * 'x')
-
-        # This will store all input data and model predictions.
-        accuracies, generations, results_dict, p_trues = [], {}, {}, []
-
-        if dataset_split == 'train':
-            if not args.get_training_set_generations:
-                logging.info('Skip training data.')
-                continue
-            dataset = train_dataset
-            possible_indices = list(set(remaining_answerable) | set(unanswerable_indices))
-
-        else:
-            dataset = validation_dataset
-            possible_indices = range(0, len(dataset))
-
-        # Evaluate over random subset of the datasets.
-        indices = random.sample(possible_indices, min(args.num_samples, len(dataset)))
-        experiment_details[dataset_split] = {'indices': indices}
-
-        if args.num_samples > len(dataset):
-            logging.warning('Not enough samples in dataset. Using all %d samples.', len(dataset))
-
-        it = 0
-        for index in tqdm(indices):
-            if (it + 1 % 10) == 0:
-                gc.collect()
-                torch.cuda.empty_cache()
-            it += 1
-
-            # Grab example at index.
+        for index in indices:
             example = dataset[index]
-            question, context = example["question"], example['context']
-            generations[example['id']] = {'question': question, 'context': context}
-            correct_answer = example['answers']['text']
+            question = example["question"]
+            test_answer = example["response"]  # Use the dataset's response as the answer to evaluate
+            # Minimal change: use "context" for the original instruction, and prepend the evaluation prompt to the response
+            generations[example['id']] = {
+                'context': question,
+                'question': "Evaluate the following model response: " + test_answer,
+                'responses': []  # initialize the responses key
+            }
 
-            current_input = make_prompt(
-                context, question, None, BRIEF, args.brief_always and args.enable_brief)
-            local_prompt = prompt + current_input
+            # Construct few-shot prompt for this specific example
+            few_shot_prompt = construct_fewshot_prompt(train_dataset, num_examples=args.num_few_shot)
 
-            logging.info('Current input: '.ljust(15) + current_input)
+            # Combine few-shot prompt with current input
+            current_input = f"Instruction: {question}\nQuestion: {question}\nAnswer: {test_answer}\nEvaluation:"
+            local_prompt = few_shot_prompt + current_input
 
-            full_responses = []
+            # Print the full prompt before generating evaluations
+            print("Few-shot prompt constructed:")
+            print(local_prompt)
 
-            # We sample 1 low temperature answer on which we will compute the
-            # accuracy and args.num_generation high temperature answers which will
-            # be used to estimate the entropy.
-
-            if dataset_split == 'train' and args.get_training_set_generations_most_likely_only:
-                num_generations = 1
-            else:
-                num_generations = args.num_generations + 1
-
+            # Generate 5 evaluations
+            full_evaluations = []
+            ratings = []
+            num_generations = 10
             for i in range(num_generations):
-
-                # Temperature for first generation is always `0.1`.
-                temperature = 0.1 if i == 0 else args.temperature
-
-                predicted_answer, token_log_likelihoods, (embedding, emb_last_before_gen, emb_before_eos) = model.predict(local_prompt, temperature, return_latent=True) 
-                
-                # Last token embedding
+                temperature = args.temperature
+                predicted_evaluation, token_log_likelihoods, (embedding, _, _) = model.predict(
+                    local_prompt, temperature, return_latent=True
+                )
                 embedding = embedding.cpu() if embedding is not None else None
-                emb_last_before_gen = emb_last_before_gen.cpu() if emb_last_before_gen is not None else None
-                emb_before_eos = emb_before_eos.cpu() if emb_before_eos is not None else None
-                
-                compute_acc = args.compute_accuracy_at_all_temps or (i == 0)
-                if correct_answer and compute_acc:
-                    acc = metric(predicted_answer, example, model)
-                else:
-                    acc = 0.0  # pylint: disable=invalid-name
+                # Minimal change: append a tuple containing the evaluation string, token log likelihoods, and embedding
+                full_evaluations.append((predicted_evaluation, token_log_likelihoods, embedding))
+                # Extract rating from predicted_evaluation
+                try:
+                    rating_str = predicted_evaluation.split("Rating: ")[1].split("\n")[0].strip()
+                    rating = int(rating_str)
+                except (IndexError, ValueError):
+                    rating = None  # Handle cases where rating extraction fails
+                ratings.append(rating)
+                evaluation_one_line = predicted_evaluation.replace('\n', ' ')
+                print(f"Evaluation {i + 1}: {evaluation_one_line}")
 
-                if i == 0:
-                    # Logging.
-                    logging.info('Iteration ' + str(it) + ':  ' + 80*'#')
-                    if args.use_context:
-                        logging.info('context: '.ljust(15) + str(context))
-                    logging.info('question: '.ljust(15) + question)
-                    logging.info('low-t prediction: '.ljust(15) + predicted_answer)
-                    logging.info('correct answer: '.ljust(15) + str(correct_answer))
-                    logging.info('accuracy: '.ljust(15) + str(acc))
+            # Compute entropy based on ratings
+            valid_ratings = [r for r in ratings if r is not None]
+            if valid_ratings:
+                unique_ratings, counts = np.unique(valid_ratings, return_counts=True)
+                probs = counts / len(valid_ratings)
+                entropy = -np.sum(probs * np.log(probs))
+            else:
+                entropy = 0  # Default entropy if no valid ratings
+            print(f"Entropy: {entropy:.4f}")
 
-                    accuracies.append(acc)
-                    most_likely_answer_dict = {
-                        'response': predicted_answer,
-                        'token_log_likelihoods': token_log_likelihoods,
-                        'embedding': embedding,
-                        'accuracy': acc,
-                        'emb_last_tok_before_gen': emb_last_before_gen,
-                        'emb_tok_before_eos': emb_before_eos, 
-                    }
+            # Minimal change: use key "responses" instead of "evaluations"
+            generations[example['id']]['responses'] = full_evaluations
+            generations[example['id']]['entropy'] = entropy
 
-                    generations[example['id']].update({
-                        'most_likely_answer': most_likely_answer_dict,
-                        'reference': utils_abstracted.get_reference(example),
-                    })
-                else:
-                    logging.info('high-t prediction '.ljust(15) + str(i) + ' : ' + predicted_answer)
-                    # Aggregate predictions over num_generations.
-                    full_responses.append(
-                        (predicted_answer, token_log_likelihoods, embedding, acc))
+        # Save generations
+        utils.save(generations, f'{dataset_split}_generations.pkl', save_dir="/workspace/saved")
 
-            # Append all predictions for this example to `generations`.
-            generations[example['id']]['responses'] = full_responses
-
-            if args.compute_p_true and dataset_split == 'validation':
-                # Already compute p_true here. Avoid cost of generations in compute_uncertainty script.
-                p_true = p_true_utils_abstracted.calculate_p_true(
-                    model, question, most_likely_answer_dict['response'],
-                    [r[0] for r in full_responses], p_true_few_shot_prompt,
-                    hint=args.p_true_hint)
-                p_trues.append(p_true)
-                logging.info('p_true: %s', p_true)
-
-        # Save generations for that split.
-        utils_abstracted.save(generations, f'{dataset_split}_generations.pkl')
-
-        # Log overall accuracy.
-        accuracy = np.mean(accuracies)
-        print(f"Overall {dataset_split} split accuracy: {accuracy}")
-        wandb.log({f"{dataset_split}_accuracy": accuracy})
-
-        if dataset_split == 'validation':
-            if args.compute_p_true:
-                results_dict['uncertainty_measures'] = {
-                    'p_false':  [1 - p for p in p_trues],
-                    'p_false_fixed':  [1 - np.exp(p) for p in p_trues],
-                }
-            utils_abstracted.save(results_dict, 'uncertainty_measures.pkl')
-
-    utils_abstracted.save(experiment_details, 'experiment_details.pkl')
-    logging.info('Run complete.')
+    print("Run complete.")
     del model
 
-
 if __name__ == '__main__':
-
-    parser = utils_abstracted.get_parser()
-    args, unknown = parser.parse_known_args()
-    logging.info('Starting new run with args: %s', args)
-
-    if unknown:
-        raise ValueError(f'Unkown args: {unknown}')
-
-    if args.compute_uncertainties:
-        args.assign_new_wandb_id = False
-
-    logging.info('STARTING `generate_answers`!')
+    parser = utils.get_parser()
+    parser.add_argument("--num_few_shot", type=int, default=5, help="Number of few-shot examples")
+    args = parser.parse_args()
+    print(f"Starting run with args: {args}")
     main(args)
-    logging.info('FINISHED `generate_answers`!')
-
-    if args.compute_uncertainties:
-        logging.info(50 * '#X')
-        logging.info('STARTING `compute_uncertainty_measures`!')
-        main_compute(args)
-        logging.info('FINISHED `compute_uncertainty_measures`!')
